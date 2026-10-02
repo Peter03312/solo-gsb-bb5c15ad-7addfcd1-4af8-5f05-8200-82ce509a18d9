@@ -350,6 +350,287 @@ def test_revision_history_accumulates(client, device):
     assert hist["reading"]["version"] == 3
 
 
+# ---------------------------------------------------------------- 阈值版本（防汛方案调整）
+
+def make_version(client, station, minutes, rise, clear, reason="方案调整"):
+    return client.post(
+        f"/stations/{station}/threshold-versions",
+        json={
+            "effective_at": iso(BASE + timedelta(minutes=minutes)),
+            "rise_threshold": rise,
+            "clear_threshold": clear,
+            "reason": reason,
+        },
+    )
+
+
+def test_threshold_version_on_unknown_station_404(client):
+    r = client.post(
+        "/stations/999/threshold-versions",
+        json={"effective_at": iso(BASE), "rise_threshold": 9.0, "clear_threshold": 7.0, "reason": "x"},
+    )
+    assert r.status_code == 404
+    assert client.get("/stations/999/threshold-versions").status_code == 404
+
+
+def test_create_threshold_version_and_history(client, station):
+    r = make_version(client, station, 60, 9.0, 7.0, reason="入汛提级")
+    assert r.status_code == 201, r.text
+    body = r.json()
+    v = body["version"]
+    assert v["station_id"] == station
+    assert v["rise_threshold"] == 9.0
+    assert v["clear_threshold"] == 7.0
+    assert v["reason"] == "入汛提级"
+    assert v["effective_at"] == iso(BASE + timedelta(minutes=60)).replace("+00:00", "Z")
+    # 调整本身不产生预警或解除
+    assert body["pending_adjudication"]["events"] == []
+    assert body["pending_adjudication"]["status"] == "normal"
+
+    hist = client.get(f"/stations/{station}/threshold-versions").json()
+    # 登记阈值作为未命中版本时的基准值
+    assert hist["baseline"] == {"rise_threshold": 10.0, "clear_threshold": 8.0}
+    assert len(hist["versions"]) == 1
+    assert hist["versions"][0]["id"] == v["id"]
+
+
+def test_threshold_version_requires_reason(client, station):
+    r = client.post(
+        f"/stations/{station}/threshold-versions",
+        json={"effective_at": iso(BASE), "rise_threshold": 9.0, "clear_threshold": 7.0, "reason": ""},
+    )
+    assert r.status_code == 400
+
+
+def test_threshold_version_naive_time_rejected(client, station):
+    r = client.post(
+        f"/stations/{station}/threshold-versions",
+        json={
+            "effective_at": "2026-10-01T01:00:00",
+            "rise_threshold": 9.0,
+            "clear_threshold": 7.0,
+            "reason": "x",
+        },
+    )
+    assert r.status_code == 400
+
+
+def test_threshold_version_invalid_thresholds_rejected(client, station):
+    base = {"effective_at": iso(BASE), "reason": "x"}
+    assert client.post(
+        f"/stations/{station}/threshold-versions",
+        json={**base, "rise_threshold": 7.0, "clear_threshold": 9.0},
+    ).status_code == 400  # 上升不大于解除
+    assert client.post(
+        f"/stations/{station}/threshold-versions",
+        json={**base, "rise_threshold": 9.0, "clear_threshold": 9.0},
+    ).status_code == 400  # 相等也拒绝
+    assert client.post(
+        f"/stations/{station}/threshold-versions",
+        json={**base, "rise_threshold": "abc", "clear_threshold": 1.0},
+    ).status_code == 400
+    for bad in ("NaN", "Infinity", "-Infinity"):
+        r = client.post(
+            f"/stations/{station}/threshold-versions",
+            content=(
+                '{"effective_at":"%s","rise_threshold":%s,"clear_threshold":1.0,"reason":"x"}'
+                % (iso(BASE), bad)
+            ),
+            headers={"content-type": "application/json"},
+        )
+        assert r.status_code == 400, f"rise_threshold={bad} 应被拒绝"
+
+
+def test_duplicate_effective_at_conflict(client, station):
+    payload = {
+        "rise_threshold": 9.0,
+        "clear_threshold": 7.0,
+        "reason": "x",
+    }
+    r1 = client.post(
+        f"/stations/{station}/threshold-versions",
+        json={"effective_at": iso(BASE + timedelta(minutes=60)), **payload},
+    )
+    assert r1.status_code == 201
+    # 同一时刻重复（换 +08:00 表示同一瞬间）→ 409
+    r2 = client.post(
+        f"/stations/{station}/threshold-versions",
+        json={
+            "effective_at": iso((BASE + timedelta(minutes=60)).astimezone(timezone(timedelta(hours=8)))),
+            **payload,
+        },
+    )
+    assert r2.status_code == 409
+    # 不同生效时刻允许登记
+    r3 = client.post(
+        f"/stations/{station}/threshold-versions",
+        json={"effective_at": iso(BASE + timedelta(minutes=120)), **payload},
+    )
+    assert r3.status_code == 201
+    hist = client.get(f"/stations/{station}/threshold-versions").json()
+    assert [v["effective_at"] for v in hist["versions"]] == [
+        iso(BASE + timedelta(minutes=60)).replace("+00:00", "Z"),
+        iso(BASE + timedelta(minutes=120)).replace("+00:00", "Z"),
+    ]
+
+
+def test_baseline_used_before_first_version(client, station, device):
+    # 版本 60 分钟起生效（上升 9 / 解除 7）；早期读数仍按登记基准 10 / 8
+    make_version(client, station, 60, 9.0, 7.0)
+    upload(client, device, 1, 0, 9.5)   # < 基准上升 10，且 < 版本上升 9？
+    tl = timeline(client, station)
+    info = {r["reading_id"]: r for r in tl["readings"]}
+    assert info[1]["threshold_version_id"] is None
+    assert info[1]["rise_threshold"] == 10.0
+    upload(client, device, 2, 5, 9.5)
+    upload(client, device, 3, 70, 9.5)  # 命中版本：9.5 >= 9，但连续被版本切换打断吗？
+    tl = timeline(client, station)
+    info = {r["reading_id"]: r for r in tl["readings"]}
+    assert info[1]["rise_threshold"] == 10.0 and info[1]["threshold_version_id"] is None
+    assert info[3]["rise_threshold"] == 9.0 and info[3]["threshold_version_id"] is not None
+    # 前两条 9.5 未达基准 10 → 连续达阈值序列从读数 3 才开始，无预警
+    assert tl["status"] == "normal"
+    assert tl["events"] == []
+
+
+def test_version_boundary_exact_time_uses_new_version(client, station, device):
+    make_version(client, station, 10, 9.0, 7.0)
+    upload(client, device, 1, 0, 9.5)   # 基准 10：未达
+    upload(client, device, 2, 5, 9.5)   # 基准 10：未达
+    upload(client, device, 3, 10, 9.5)  # 同一时刻采用新版本 9：达阈值，但序列从此开始
+    tl = timeline(client, station)
+    info = {r["reading_id"]: r for r in tl["readings"]}
+    assert info[3]["threshold_version_id"] is not None
+    assert tl["status"] == "normal"
+    upload(client, device, 4, 15, 9.5)
+    upload(client, device, 5, 25, 9.5)  # 版本下连续 3 条、首尾 15 分钟 → 预警
+    tl = timeline(client, station)
+    assert tl["status"] == "warning"
+    ev = tl["events"][0]
+    assert ev["threshold_version_id"] is not None
+    assert ev["rise_threshold"] == 9.0
+    assert ev["at"] == iso(BASE + timedelta(minutes=25)).replace("+00:00", "Z")
+
+
+def test_cross_version_continuous_readings_each_own_threshold(client, station, device):
+    # 基准上升 10：前两条 10.5 达阈值；新版本（t=10 起）上升 11，第三条 10.5 不再达阈值
+    make_version(client, station, 10, 11.0, 9.0)
+    upload(client, device, 1, 0, 10.5)
+    upload(client, device, 2, 5, 10.5)
+    upload(client, device, 3, 10, 10.5)  # 按新版本 11 判断 → 打断连续
+    upload(client, device, 4, 15, 10.5)
+    tl = timeline(client, station)
+    assert tl["status"] == "normal"
+    assert tl["events"] == []
+
+
+def test_threshold_change_itself_emits_no_event(client, station, device):
+    # 无读数时调整阈值（生效时间设在未来，不影响后续测试读数）：不产生任何事件
+    r = make_version(client, station, 10000, 100.0, 13.0, reason="演练调整")
+    assert r.status_code == 201
+    assert r.json()["pending_adjudication"]["events"] == []
+    assert r.json()["pending_adjudication"]["status"] == "normal"
+
+    _make_warning(client, device)
+    assert timeline(client, station)["status"] == "warning"
+    # 新版本自 t=0 起覆盖全部历史时间线：12 < 100 不再达上升阈值，重算后无事件。
+    # 关键：不存在“因调整动作本身”而产生的预警/解除，事件只可能由读数判定产生。
+    r2 = client.post(
+        f"/stations/{station}/threshold-versions",
+        json={"effective_at": iso(BASE), "rise_threshold": 100.0, "clear_threshold": 13.0, "reason": "放宽"},
+    )
+    assert r2.status_code == 201
+    events = r2.json()["pending_adjudication"]["events"]
+    assert events == []
+    assert r2.json()["pending_adjudication"]["status"] == "normal"
+
+
+def test_segment_break_and_cross_version_clear_still_works(client, station, device):
+    # 预警：基准阈值 10/8
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 12.0)
+    # 版本自 12 分钟起：解除阈值降到 6
+    make_version(client, station, 12, 20.0, 6.0)
+    upload(client, device, 4, 12, 5.0)   # 命中版本，<= 6
+    upload(client, device, 5, 40, 5.0)   # 断段但解除计数跨段延续 → 解除
+    tl = timeline(client, station)
+    assert tl["status"] == "normal"
+    ev = tl["events"][-1]
+    assert ev["type"] == "cleared"
+    assert ev["clear_threshold"] == 6.0
+    assert ev["threshold_version_id"] is not None
+
+
+def test_recompute_after_correction_uses_versions(client, station, device):
+    make_version(client, station, 100, 9.0, 7.0)
+    # 读数在 t=0/5/10，基准 10 下 12 达阈值 → 预警
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 12.0)
+    assert timeline(client, station)["status"] == "warning"
+    # 更正读数 2 的观测时间到 t=110（落入版本区间），水位 5 不影响上升序列；
+    # 全部有效读数重算后，原连续段被时间重排打断
+    r = client.post(
+        "/readings/2/correct",
+        json={"observed_at": iso(BASE + timedelta(minutes=110)), "reason": "时钟偏移"},
+    )
+    assert r.status_code == 200
+    assert r.json()["pending_adjudication"]["status"] == "normal"
+    tl = timeline(client, station)
+    info = {x["reading_id"]: x for x in tl["readings"]}
+    assert info[2]["threshold_version_id"] is not None
+    assert info[2]["rise_threshold"] == 9.0
+
+
+def test_void_then_recompute_uses_versions(client, station, device):
+    make_version(client, station, 0, 9.0, 7.0)
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 9.5)
+    assert timeline(client, station)["status"] == "warning"
+    client.post("/readings/2/void", json={"reason": "误报"})
+    assert timeline(client, station)["status"] == "normal"
+
+
+def test_published_snapshot_unchanged_by_threshold_adjustment(client, station, device):
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 9.5)  # 基准 10：无预警
+    r = client.post("/publish", json={"note": "调整前发布"})
+    pub_id = r.json()["publication_id"]
+    assert client.get("/public/current").json()["timelines"][0]["status"] == "normal"
+
+    # 调整阈值使历史读数应触发预警：历史发布快照不变
+    make_version(client, station, 0, 9.0, 7.0, reason="提级")
+    assert timeline(client, station)["status"] == "warning"
+    snap = client.get(f"/publications/{pub_id}").json()
+    assert snap["timelines"][0]["status"] == "normal"
+    assert client.get("/public/current").json()["timelines"][0]["status"] == "normal"
+    # 重新发布才反映调整
+    client.post("/publish", json={"note": "调整后发布"})
+    cur = client.get("/public/current").json()
+    assert cur["publication_id"] == pub_id + 1
+    assert cur["timelines"][0]["status"] == "warning"
+    assert cur["timelines"][0]["events"][0]["rise_threshold"] == 9.0
+
+
+def test_version_history_per_station_independent(client, device):
+    other = client.post(
+        "/stations", json={"name": "南河站", "rise_threshold": 20.0, "clear_threshold": 15.0}
+    ).json()["id"]
+    make_version(client, 1, 0, 9.0, 7.0)
+    hist = client.get(f"/stations/{other}/threshold-versions").json()
+    assert hist["versions"] == []
+    assert hist["baseline"] == {"rise_threshold": 20.0, "clear_threshold": 15.0}
+
+
+def test_duplicate_effective_at_per_station_scope(client, station):
+    other = client.post(
+        "/stations", json={"name": "南河站", "rise_threshold": 20.0, "clear_threshold": 15.0}
+    ).json()["id"]
+    body = {"effective_at": iso(BASE), "rise_threshold": 9.0, "clear_threshold": 7.0, "reason": "x"}
+    assert client.post(f"/stations/{station}/threshold-versions", json=body).status_code == 201
+    # 不同站同一生效时刻允许
+    assert client.post(f"/stations/{other}/threshold-versions", json=body).status_code == 201
+
+
 # ---------------------------------------------------------------- 发布冻结
 
 def test_publish_freezes_timeline(client, station, device):

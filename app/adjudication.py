@@ -17,11 +17,25 @@ from typing import List, Optional
 
 @dataclass(frozen=True)
 class Reading:
-    """参与裁定的一条有效读数。"""
+    """参与裁定的一条有效读数。
+
+    rise_threshold / clear_threshold 给出该读数按观测时间命中的阈值版本；
+    为 None 时（旧调用方 / 无版本场景）回退到 adjudicate 传入的站点基准阈值。
+    threshold_version_id 记录命中的版本 id；None 表示使用登记基准值。
+    """
 
     id: int
     observed_at: datetime  # 已统一为带时区时间（UTC）
     water_level: float
+    rise_threshold: Optional[float] = None
+    clear_threshold: Optional[float] = None
+    threshold_version_id: Optional[int] = None
+
+    def thresholds(self, base_rise: float, base_clear: float) -> tuple[float, float]:
+        """返回本条读数实际采用的（上升，解除）阈值。"""
+        rise = self.rise_threshold if self.rise_threshold is not None else base_rise
+        clear = self.clear_threshold if self.clear_threshold is not None else base_clear
+        return rise, clear
 
 
 @dataclass(frozen=True)
@@ -41,6 +55,10 @@ class Event:
     run_start: datetime
     run_count: int
     span_seconds: float
+    # 触发读数当时命中的阈值（跨版本连续读数分别按各自阈值判断）
+    rise_threshold: Optional[float] = None
+    clear_threshold: Optional[float] = None
+    threshold_version_id: Optional[int] = None
 
 
 @dataclass
@@ -80,6 +98,10 @@ def adjudicate(
         )
 
     for r in ordered:
+        # 每条有效读数按观测时间采用最近已生效版本（同一时刻采用新版本）；
+        # 读数未携带版本阈值时回退到站点登记基准值。
+        r_rise, r_clear = r.thresholds(rise_threshold, clear_threshold)
+
         if prev is None or (r.observed_at - prev.observed_at) > rules.segment_gap:
             if prev is not None:
                 close_segment(prev)
@@ -91,7 +113,7 @@ def adjudicate(
         seg_count += 1
 
         if status == "normal":
-            if r.water_level >= rise_threshold:
+            if r.water_level >= r_rise:
                 rise_run.append(r)
                 span = r.observed_at - rise_run[0].observed_at
                 if len(rise_run) >= rules.rise_min_count and span >= rules.rise_min_span:
@@ -103,6 +125,9 @@ def adjudicate(
                             run_start=rise_run[0].observed_at,
                             run_count=len(rise_run),
                             span_seconds=span.total_seconds(),
+                            rise_threshold=r_rise,
+                            clear_threshold=r_clear,
+                            threshold_version_id=r.threshold_version_id,
                         )
                     )
                     status = "warning"
@@ -111,7 +136,7 @@ def adjudicate(
             else:
                 rise_run = []
         else:  # warning
-            if r.water_level <= clear_threshold:
+            if r.water_level <= r_clear:
                 clear_run.append(r)
                 span = r.observed_at - clear_run[0].observed_at
                 if len(clear_run) >= rules.clear_min_count and span >= rules.clear_min_span:
@@ -123,6 +148,9 @@ def adjudicate(
                             run_start=clear_run[0].observed_at,
                             run_count=len(clear_run),
                             span_seconds=span.total_seconds(),
+                            rise_threshold=r_rise,
+                            clear_threshold=r_clear,
+                            threshold_version_id=r.threshold_version_id,
                         )
                     )
                     status = "normal"

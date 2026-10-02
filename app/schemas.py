@@ -62,3 +62,20 @@ class CorrectRequest(BaseModel):
 class PublishRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     note: Optional[str] = Field(default=None, max_length=500)
+
+
+class ThresholdVersionCreate(BaseModel):
+    """防汛方案调整：登记某站的一版阈值（自生效时间起采用）。"""
+
+    effective_at: datetime = Field(description="带时区的生效时间，如 2026-10-02T08:00:00+08:00")
+    rise_threshold: FiniteFloat = Field(description="上升阈值（有限数值）")
+    clear_threshold: FiniteFloat = Field(description="解除阈值（有限数值，必须严格小于上升阈值）")
+    reason: str = Field(min_length=1, max_length=500, description="调整原因（必填）")
+
+    _tz = field_validator("effective_at")(_require_tz_aware)
+
+    @model_validator(mode="after")
+    def _check_thresholds(self) -> "ThresholdVersionCreate":
+        if not self.rise_threshold > self.clear_threshold:
+            raise ValueError("上升阈值必须严格大于解除阈值")
+        return self
