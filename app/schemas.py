@@ -30,6 +30,24 @@ class DeviceCreate(BaseModel):
     device_no: str = Field(min_length=1, max_length=100, description="设备号（全局唯一）")
 
 
+class ThresholdVersionCreate(BaseModel):
+    """防汛方案调整：为监测站登记一个带生效时间的阈值版本。"""
+
+    effective_at: datetime = Field(description="生效时间（必须带时区，如 2026-10-01T08:00:00+08:00）")
+    rise_threshold: FiniteFloat = Field(description="上升阈值（有限数值）")
+    clear_threshold: FiniteFloat = Field(description="解除阈值（有限数值，必须严格低于上升阈值）")
+    reason: str = Field(min_length=1, max_length=500, description="调整原因（必填）")
+    created_by: Optional[str] = Field(default=None, max_length=100, description="登记人")
+
+    _tz = field_validator("effective_at")(_require_tz_aware)
+
+    @model_validator(mode="after")
+    def _check_thresholds(self) -> "ThresholdVersionCreate":
+        if not self.rise_threshold > self.clear_threshold:
+            raise ValueError("上升阈值必须严格大于解除阈值")
+        return self
+
+
 class ReadingIngest(BaseModel):
     device_no: str = Field(min_length=1, max_length=100)
     seq: int = Field(ge=0, description="设备内递增序号")

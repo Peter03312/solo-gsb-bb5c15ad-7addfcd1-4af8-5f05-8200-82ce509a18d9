@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import sqlite3
@@ -23,6 +24,7 @@ from .schemas import (
     PublishRequest,
     ReadingIngest,
     StationCreate,
+    ThresholdVersionCreate,
     VoidRequest,
 )
 
@@ -77,6 +79,18 @@ def revision_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def threshold_version_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "version_no": row["version_no"],
+        "effective_at": iso_z(parse_stored(row["effective_at"])),
+        "rise_threshold": row["rise_threshold"],
+        "clear_threshold": row["clear_threshold"],
+        "reason": row["reason"],
+        "created_by": row["created_by"],
+        "created_at": row["created_at"],
+    }
+
+
 def _safe_json(obj: Any) -> Any:
     """保证可 JSON 序列化：NaN/Inf 转字符串，未知类型经 default=str 兜底。"""
     def walk(o: Any) -> Any:
@@ -106,8 +120,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app = FastAPI(
         title="山洪水位预警裁定服务",
-        version="1.0.0",
-        description="监测站/设备登记、读数补传（幂等）、审核修订、预警裁定与发布冻结。",
+        version="1.1.0",
+        description="监测站/设备登记、阈值版本（防汛方案调整）、读数补传（幂等）、审核修订、预警裁定与发布冻结。",
     )
     app.state.db = db
     app.state.settings = settings
@@ -135,16 +149,47 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             """,
             (station_id,),
         ).fetchall()
-        readings = [
-            Reading(id=r["id"], observed_at=parse_stored(r["observed_at"]), water_level=r["water_level"])
-            for r in rows
-        ]
+
+        # 已生效阈值版本（按生效时间升序）。读数按观测时间取最近已生效版本；
+        # 同一时刻 bisect_right 命中新版本；未命中则回落登记基准阈值。
+        vrows = conn.execute(
+            """
+            SELECT *
+            FROM threshold_versions
+            WHERE station_id = ?
+            ORDER BY effective_at, version_no
+            """,
+            (station_id,),
+        ).fetchall()
+        eff_times = [parse_stored(v["effective_at"]) for v in vrows]
+        versions_dicts = [threshold_version_to_dict(v) for v in vrows]
+
+        readings = []
+        for r in rows:
+            obs = parse_stored(r["observed_at"])
+            idx = bisect.bisect_right(eff_times, obs) - 1
+            if idx >= 0:
+                v = vrows[idx]
+                readings.append(
+                    Reading(
+                        id=r["id"],
+                        observed_at=obs,
+                        water_level=r["water_level"],
+                        rise_threshold=v["rise_threshold"],
+                        clear_threshold=v["clear_threshold"],
+                        threshold_version_no=v["version_no"],
+                    )
+                )
+            else:
+                readings.append(Reading(id=r["id"], observed_at=obs, water_level=r["water_level"]))
+
         res = adjudicate(readings, st["rise_threshold"], st["clear_threshold"], rules)
         return {
             "station_id": station_id,
             "station_name": st["name"],
             "rise_threshold": st["rise_threshold"],
             "clear_threshold": st["clear_threshold"],
+            "threshold_versions": versions_dicts,
             "status": res.status,
             "active_warning_since": iso_z(res.active_warning_since) if res.active_warning_since else None,
             "readings_considered": res.readings_considered,
@@ -156,6 +201,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     "run_start": iso_z(e.run_start),
                     "run_count": e.run_count,
                     "span_seconds": e.span_seconds,
+                    "threshold_version_no": e.threshold_version_no,
+                    "rise_threshold": e.rise_threshold,
+                    "clear_threshold": e.clear_threshold,
                 }
                 for e in res.events
             ],
@@ -278,6 +326,103 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             {"id": r["id"], "device_no": r["device_no"], "station_id": r["station_id"], "created_at": r["created_at"]}
             for r in rows
         ]
+
+    # ------------------------------------------------------------ 阈值版本（防汛方案调整）
+
+    @app.post("/stations/{station_id}/threshold-versions", status_code=201, tags=["阈值版本"])
+    def create_threshold_version(station_id: int, body: ThresholdVersionCreate) -> dict[str, Any]:
+        eff_utc = body.effective_at.astimezone(timezone.utc)
+        eff_str = eff_utc.isoformat()
+        now = iso_z(utc_now())
+        with db.write_tx() as conn:
+            get_station_or_404(conn, station_id)
+            # 同站生效时间唯一（不同时区表示的同一时刻也算重复）
+            dup = conn.execute(
+                "SELECT id FROM threshold_versions WHERE station_id=? AND effective_at=?",
+                (station_id, eff_str),
+            ).fetchone()
+            if dup is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"监测站 {station_id} 已存在生效时间为 {iso_z(eff_utc)} 的阈值版本",
+                )
+            # 进程内锁串行化，max()+1 安全；(station_id, version_no) 唯一约束兜底并发
+            next_no = conn.execute(
+                "SELECT COALESCE(MAX(version_no), 0) + 1 AS n FROM threshold_versions WHERE station_id=?",
+                (station_id,),
+            ).fetchone()["n"]
+            try:
+                cur = conn.execute(
+                    """
+                    INSERT INTO threshold_versions(station_id, version_no, effective_at,
+                                                   rise_threshold, clear_threshold,
+                                                   reason, created_by, created_at)
+                    VALUES (?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        station_id,
+                        next_no,
+                        eff_str,
+                        body.rise_threshold,
+                        body.clear_threshold,
+                        body.reason,
+                        body.created_by,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"监测站 {station_id} 已存在生效时间为 {iso_z(eff_utc)} 的阈值版本",
+                )
+            row = conn.execute(
+                "SELECT * FROM threshold_versions WHERE id=?", (cur.lastrowid,)
+            ).fetchone()
+            # 阈值调整本身不产生预警/解除事件：仅回算当前待发布状态供调用方确认
+            timeline = compute_timeline(conn, station_id)
+        return {
+            **threshold_version_to_dict(row),
+            "station_id": station_id,
+            "pending_adjudication": {
+                "station_id": station_id,
+                "status": timeline["status"],
+                "event_count": len(timeline["events"]),
+                "events": timeline["events"],
+            },
+        }
+
+    @app.get("/stations/{station_id}/threshold-versions", tags=["阈值版本"])
+    def list_threshold_versions(station_id: int) -> dict[str, Any]:
+        with db.read() as conn:
+            st = get_station_or_404(conn, station_id)
+            rows = conn.execute(
+                "SELECT * FROM threshold_versions WHERE station_id=? ORDER BY version_no",
+                (station_id,),
+            ).fetchall()
+        return {
+            "station_id": station_id,
+            "baseline": {
+                "rise_threshold": st["rise_threshold"],
+                "clear_threshold": st["clear_threshold"],
+                "note": "登记阈值：读数观测时间早于所有版本生效时间（未命中）时使用",
+            },
+            "versions": [threshold_version_to_dict(r) for r in rows],
+        }
+
+    @app.get("/stations/{station_id}/threshold-versions/{version_no}", tags=["阈值版本"])
+    def get_threshold_version(station_id: int, version_no: int) -> dict[str, Any]:
+        with db.read() as conn:
+            get_station_or_404(conn, station_id)
+            row = conn.execute(
+                "SELECT * FROM threshold_versions WHERE station_id=? AND version_no=?",
+                (station_id, version_no),
+            ).fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"监测站 {station_id} 不存在阈值版本 {version_no}",
+            )
+        return {"station_id": station_id, **threshold_version_to_dict(row)}
 
     # ------------------------------------------------------------ 读数补传（幂等）
 

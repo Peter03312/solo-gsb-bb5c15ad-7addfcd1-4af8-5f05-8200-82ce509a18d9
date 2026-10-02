@@ -57,3 +57,43 @@ curl -s "$BASE/public/stations/1/timeline"; echo
 step "12. 作废读数示例（读数 2，带原因）"
 curl -s -X POST "$BASE/readings/2/void" -H "$J" \
   -d '{"reason":"传感器故障","auditor":"李审"}'; echo
+
+step "13. 防汛方案调整：登记阈值版本（带时区生效时间/上升阈值/解除阈值/原因）"
+# 新版本自 08:30(+08:00) 起生效：上升阈值上调到 15.0、解除阈值上调到 12.0
+curl -s -X POST "$BASE/stations/1/threshold-versions" -H "$J" \
+  -d '{"effective_at":"2026-10-01T08:30:00+08:00","rise_threshold":15.0,"clear_threshold":12.0,"reason":"入汛方案调整","created_by":"张工"}'; echo
+
+step "14. 查询阈值版本历史（含未命中版本时使用的登记基准阈值）"
+curl -s "$BASE/stations/1/threshold-versions"; echo
+
+step "15. 阈值版本按观测时间逐读数生效：补传 08:30 后的读数"
+# 水位 13.0 在旧基准（上升 10.0）下必预警，但在新版本（上升 15.0）下不预警
+curl -s -X POST "$BASE/readings" -H "$J" \
+  -d '{"device_no":"DEV-001","seq":130,"observed_at":"2026-10-01T08:30:00+08:00","water_level":13.0}' > /dev/null
+curl -s -X POST "$BASE/readings" -H "$J" \
+  -d '{"device_no":"DEV-001","seq":135,"observed_at":"2026-10-01T08:35:00+08:00","water_level":13.0}' > /dev/null
+curl -s -X POST "$BASE/readings" -H "$J" \
+  -d '{"device_no":"DEV-001","seq":140,"observed_at":"2026-10-01T08:40:00+08:00","water_level":13.0}' > /dev/null
+# 08:45 起三条 16.0 ≥ 新版本上升阈值 15.0、首尾 10 分钟 → 按新版本预警
+curl -s -X POST "$BASE/readings" -H "$J" \
+  -d '{"device_no":"DEV-001","seq":145,"observed_at":"2026-10-01T08:45:00+08:00","water_level":16.0}' > /dev/null
+curl -s -X POST "$BASE/readings" -H "$J" \
+  -d '{"device_no":"DEV-001","seq":150,"observed_at":"2026-10-01T08:50:00+08:00","water_level":16.0}' > /dev/null
+curl -s -X POST "$BASE/readings" -H "$J" \
+  -d '{"device_no":"DEV-001","seq":155,"observed_at":"2026-10-01T08:55:00+08:00","water_level":16.0}' > /dev/null
+echo "待发布时间线（事件携带 threshold_version_no 与当时阈值）："
+curl -s "$BASE/stations/1/timeline"; echo
+
+step "16. 拒绝非法阈值版本（依次为：重复生效时间 409 / 上升<=解除 400 / 无时区 400）"
+curl -s -o /dev/null -w '重复生效时间(同一时刻换+08:00表示) -> HTTP %{http_code}\n' \
+  -X POST "$BASE/stations/1/threshold-versions" -H "$J" \
+  -d '{"effective_at":"2026-10-01T00:30:00Z","rise_threshold":16.0,"clear_threshold":10.0,"reason":"重复时刻"}'
+curl -s -o /dev/null -w '上升阈值不大于解除阈值 -> HTTP %{http_code}\n' \
+  -X POST "$BASE/stations/1/threshold-versions" -H "$J" \
+  -d '{"effective_at":"2026-10-01T09:00:00+08:00","rise_threshold":12.0,"clear_threshold":12.0,"reason":"非法阈值"}'
+curl -s -o /dev/null -w '生效时间不带时区 -> HTTP %{http_code}\n' \
+  -X POST "$BASE/stations/1/threshold-versions" -H "$J" \
+  -d '{"effective_at":"2026-10-01T09:00:00","rise_threshold":16.0,"clear_threshold":10.0,"reason":"无时区"}'
+curl -s -o /dev/null -w '站点不存在 -> HTTP %{http_code}\n' \
+  -X POST "$BASE/stations/999/threshold-versions" -H "$J" \
+  -d '{"effective_at":"2026-10-01T09:00:00+08:00","rise_threshold":16.0,"clear_threshold":10.0,"reason":"无此站"}'

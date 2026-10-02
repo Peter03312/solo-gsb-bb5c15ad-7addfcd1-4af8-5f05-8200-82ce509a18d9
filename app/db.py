@@ -60,6 +60,20 @@ CREATE TABLE IF NOT EXISTS reading_revisions (
     created_at      TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS threshold_versions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    station_id      INTEGER NOT NULL REFERENCES stations(id),
+    version_no      INTEGER NOT NULL,          -- 站内从 1 递增
+    effective_at    TEXT NOT NULL,             -- 生效时间（UTC ISO8601，请求须带时区）
+    rise_threshold  REAL NOT NULL,             -- 上升阈值（必须为有限值且严格大于解除阈值）
+    clear_threshold REAL NOT NULL,             -- 解除阈值
+    reason          TEXT NOT NULL,
+    created_by      TEXT,
+    created_at      TEXT NOT NULL,
+    UNIQUE (station_id, version_no),
+    UNIQUE (station_id, effective_at)          -- 拒绝同站重复生效时间
+);
+
 CREATE TABLE IF NOT EXISTS publications (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     published_at TEXT NOT NULL,
